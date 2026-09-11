@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - '*.apk'
+      - '*.zip'
       - '.github/workflows/patch-moviebox.yml'
 
 jobs:
@@ -27,17 +28,55 @@ jobs:
           sudo chmod +x /usr/local/bin/apktool
           apktool --version
 
-      - name: Locate original APK
+      - name: Reconstruct APK from uploaded ZIPs if needed
         id: apk
         shell: bash
         run: |
-          APK=$(find . -maxdepth 1 -type f -name '*.apk' | head -n 1)
-          if [ -z "$APK" ]; then
-            echo 'No APK found in repository root.' >&2
+          set -euo pipefail
+
+          APK=$(find . -maxdepth 1 -type f -name '*.apk' | head -n 1 || true)
+          if [ -n "$APK" ]; then
+            echo "path=$APK" >> "$GITHUB_OUTPUT"
+            echo "Using APK already in repository: $APK"
+            exit 0
+          fi
+
+          mkdir -p extracted_parts
+          shopt -s nullglob
+          ZIPS=(./*.zip)
+          if [ ${#ZIPS[@]} -eq 0 ]; then
+            echo 'No APK or ZIP parts found in repository root.' >&2
             exit 1
           fi
-          echo "path=$APK" >> "$GITHUB_OUTPUT"
-          echo "Using $APK"
+
+          for z in "${ZIPS[@]}"; do
+            echo "Inspecting $z"
+            unzip -l "$z" || true
+            d="extracted_parts/$(basename "$z" .zip)"
+            mkdir -p "$d"
+            unzip -o "$z" -d "$d"
+          done
+
+          APK=$(find extracted_parts -type f -name '*.apk' | head -n 1 || true)
+          if [ -n "$APK" ]; then
+            echo "Found APK inside archive: $APK"
+            cp "$APK" reconstructed.apk
+          else
+            mapfile -t PARTS < <(find extracted_parts -type f | sort -V)
+            if [ ${#PARTS[@]} -eq 0 ]; then
+              echo 'ZIPs extracted but contained no files.' >&2
+              exit 1
+            fi
+            echo 'No complete APK found; concatenating extracted files in natural order:'
+            printf '  %s\n' "${PARTS[@]}"
+            cat "${PARTS[@]}" > reconstructed.apk
+          fi
+
+          echo 'Testing reconstructed APK as ZIP container...'
+          unzip -t reconstructed.apk >/tmp/apk-test.txt
+          tail -n 5 /tmp/apk-test.txt
+          echo "path=reconstructed.apk" >> "$GITHUB_OUTPUT"
+          ls -lh reconstructed.apk
 
       - name: Decompile APK
         run: |
@@ -56,7 +95,7 @@ jobs:
           echo "file=$FILE" >> "$GITHUB_OUTPUT"
           echo "Found $FILE"
 
-      - name: Patch player activity with FLAG_KEEP_SCREEN_ON
+      - name: Patch playback activity with FLAG_KEEP_SCREEN_ON
         shell: python
         env:
           PLAYER_FILE: ${{ steps.player.outputs.file }}
@@ -65,87 +104,56 @@ jobs:
           p = pathlib.Path(os.environ['PLAYER_FILE'])
           text = p.read_text(encoding='utf-8')
 
-          # Patch onCreate immediately after the invoke-super call. This avoids
-          # any XML/resource changes and keeps the fix scoped to the real player activity.
-          m = re.search(r'(\.method[^\n]* onCreate\(Landroid/os/Bundle;\)V.*?\n)(.*?)(invoke-super \{p0, p1\}, [^\n]*->onCreate\(Landroid/os/Bundle;\)V\n)', text, re.S)
-          if not m:
-            raise SystemExit('Could not locate DetailPlayerActivity.onCreate super call')
+          method_match = re.search(r'\.method[^\n]* onCreate\(Landroid/os/Bundle;\)V\n', text)
+          if not method_match:
+              raise SystemExit('DetailPlayerActivity.onCreate not found')
 
-          method_start = m.group(1)
-          body_before_super = m.group(2)
-          super_call = m.group(3)
+          start = method_match.start()
+          end = text.find('.end method', start)
+          if end < 0:
+              raise SystemExit('Could not determine onCreate method end')
+          block = text[start:end]
 
-          # Ensure at least one local register is available for Window object.
-          method_block_start = m.start()
-          method_end = text.find('.end method', method_block_start)
-          if method_end == -1:
-            raise SystemExit('Could not determine onCreate method extent')
-          block = text[method_block_start:method_end]
-
-          locals_match = re.search(r'\n\s*\.locals\s+(\d+)', block)
-          regs_match = re.search(r'\n\s*\.registers\s+(\d+)', block)
-          if locals_match:
-            n = int(locals_match.group(1))
-            if n < 1:
-              block = block[:locals_match.start(1)] + '1' + block[locals_match.end(1):]
-              # reconstruct text temporarily below
-          elif regs_match:
-            n = int(regs_match.group(1))
-            # p0,p1 already consume 2 regs; add one scratch register conservatively
-            block = block[:regs_match.start(1)] + str(n + 1) + block[regs_match.end(1):]
+          if 'Landroid/view/Window;->addFlags(I)V' in block and '0x80' in block:
+              print('FLAG_KEEP_SCREEN_ON patch already present')
           else:
-            raise SystemExit('No .locals or .registers directive found in onCreate')
+              locals_m = re.search(r'(?m)^\s*\.locals\s+(\d+)\s*$', block)
+              regs_m = re.search(r'(?m)^\s*\.registers\s+(\d+)\s*$', block)
+              if locals_m:
+                  n = int(locals_m.group(1))
+                  if n < 2:
+                      block = block[:locals_m.start(1)] + '2' + block[locals_m.end(1):]
+              elif regs_m:
+                  n = int(regs_m.group(1))
+                  block = block[:regs_m.start(1)] + str(n + 2) + block[regs_m.end(1):]
+              else:
+                  raise SystemExit('No .locals or .registers directive in onCreate')
 
-          injection = '''\n    # Keep screen awake while DetailPlayerActivity is visible\n    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;\n    move-result-object v0\n    const/16 v1, 0x80\n    invoke-virtual {v0, v1}, Landroid/view/Window;->addFlags(I)V\n'''
-
-          # We need two locals (v0 and v1). Adjust locals/registers in the actual method block.
-          block = text[method_block_start:method_end]
-          locals_match = re.search(r'\n\s*\.locals\s+(\d+)', block)
-          regs_match = re.search(r'\n\s*\.registers\s+(\d+)', block)
-          if locals_match:
-            n = int(locals_match.group(1))
-            if n < 2:
-              block = block[:locals_match.start(1)] + '2' + block[locals_match.end(1):]
-          elif regs_match:
-            n = int(regs_match.group(1))
-            block = block[:regs_match.start(1)] + str(n + 2) + block[regs_match.end(1):]
-
-          # Insert after invoke-super inside the adjusted method block.
-          block = re.sub(
-            r'(invoke-super \{p0, p1\}, [^\n]*->onCreate\(Landroid/os/Bundle;\)V\n)',
-            r'\1' + injection,
-            block,
-            count=1,
-          )
-          if injection.strip() not in block:
-            raise SystemExit('Injection failed')
-
-          text = text[:method_block_start] + block + text[method_end:]
-          p.write_text(text, encoding='utf-8')
-          print(f'Patched {p}')
-
-      - name: Ensure WAKE_LOCK permission
-        shell: python
-        run: |
-          from pathlib import Path
-          p = Path('decompiled/AndroidManifest.xml')
-          text = p.read_text(encoding='utf-8')
-          perm = '<uses-permission android:name="android.permission.WAKE_LOCK" />'
-          if 'android.permission.WAKE_LOCK' not in text:
-            idx = text.find('>') + 1
-            text = text[:idx] + '\n    ' + perm + text[idx:]
-            p.write_text(text, encoding='utf-8')
-            print('Added WAKE_LOCK permission')
-          else:
-            print('WAKE_LOCK permission already present')
+              pattern = r'(invoke-super \{p0, p1\}, [^\n]*->onCreate\(Landroid/os/Bundle;\)V\n)'
+              injection = (
+                  r'\1'
+                  '\n    # Keep screen awake while the movie player is open\n'
+                  '    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;\n'
+                  '    move-result-object v0\n'
+                  '    const/16 v1, 0x80\n'
+                  '    invoke-virtual {v0, v1}, Landroid/view/Window;->addFlags(I)V\n'
+              )
+              block2, count = re.subn(pattern, injection, block, count=1)
+              if count != 1:
+                  raise SystemExit('Could not locate invoke-super onCreate call')
+              block = block2
+              text = text[:start] + block + text[end:]
+              p.write_text(text, encoding='utf-8')
+              print(f'Patched {p}')
 
       - name: Rebuild unsigned APK
         run: |
           apktool b decompiled -o MovieBox_keep_awake_UNSIGNED.apk
 
-      - name: Verify APK exists
+      - name: Verify rebuilt APK
         run: |
           test -s MovieBox_keep_awake_UNSIGNED.apk
+          unzip -t MovieBox_keep_awake_UNSIGNED.apk >/dev/null
           ls -lh MovieBox_keep_awake_UNSIGNED.apk
 
       - name: Upload rebuilt APK
